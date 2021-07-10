@@ -1,0 +1,393 @@
+name: Build (Windows x86_64)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '*'
+
+env:
+  ARCH: x86_64
+  TARGET: x86_64-w64-mingw32
+  CHOST: x86_64-pc-linux-gnu
+  PREFIX: /usr/x86_64-w64-mingw32
+  CC: x86_64-w64-mingw32-gcc
+  CXX: x86_64-w64-mingw32-g++
+  CFLAGS: -D_FORTIFY_SOURCE=2 -O2 -pipe -fno-plt -fexceptions
+  CXXFLAGS: -D_FORTIFY_SOURCE=2 -O2 -pipe -fno-plt -fexceptions
+  LDFLAGS: -fstack-protector
+  LIBGCC: /usr/lib/gcc/x86_64-w64-mingw32/10-posix/libgcc_s.a
+
+jobs:
+  build:
+    name: "Build Invader"
+    runs-on: ubuntu-20.04
+    steps: 
+    - name: Set up tools
+      run: |-
+          sudo apt update
+          sudo apt install -y software-properties-common build-essential git cmake python3.8 zip gnupg curl
+
+    - name: Set up mingw-w64
+      run: |-
+          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 04EE7237B7D453EC
+          sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 648ACFD622F3D138
+          sudo add-apt-repository "deb http://ftp.de.debian.org/debian sid main"
+          sudo apt install -t sid -y mingw-w64
+
+          # Set posix instead win32
+          sudo update-alternatives --set $CC /usr/bin/$CC-posix
+          sudo update-alternatives --set $CXX /usr/bin/$CXX-posix
+
+          ### IMPORTANT
+          ## If you are going to install MinGW from the debian sid repository,
+          ## make sure to block updates for MinGW packages and then remove the
+          ## repository before doing an update or you will get a lot of unmet
+          ## dependencies errors.
+
+    - name: Set up build environment
+      run: |-
+          # Create directories
+          mkdir -p build/output
+          mkdir -p build/ext/sources
+
+          # Make CMake toolchain file
+          printf '%s\n' \
+            "set (CMAKE_SYSTEM_NAME Windows)" \
+            "set (CMAKE_SYSTEM_PROCESSOR x86_64)" \
+            "set (CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)" \
+            "set (CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)" \
+            "set (CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)" \
+            "set (CMAKE_FIND_ROOT_PATH /usr/x86_64-w64-mingw32)" \
+            "set (CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)" \
+            "set (CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)" \
+            "set (CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)" \
+            "set (CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)" \
+          > build/toolchain.cmake
+
+    - name: Build zlib
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://github.com/madler/zlib/archive/v1.2.11.tar.gz' | tar -x --gzip
+        cd zlib-*
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX
+        cd build
+        sudo make -j $(nproc) install
+
+    - name: Build Zstandard library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://github.com/facebook/zstd/archive/v1.4.5.tar.gz' | tar -x --gzip
+        cd zstd-*
+        cd build/cmake
+        cmake \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DZSTD_BUILD_PROGRAMS=OFF \
+          -DZSTD_BUILD_SHARED=ON \
+          -DZSTD_BUILD_STATIC=ON \
+          -DZSTD_ZLIB_SUPPORT=ON
+        sudo make -j $(nproc) install
+        # This is known bug on this tag. https://github.com/facebook/zstd/issues/2160
+        sudo cp lib/libzstd.dll $PREFIX/bin
+
+    - name: Build libiconv
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.16.tar.gz' | tar -x --gzip
+        cd libiconv-*
+        mkdir build
+        cd build
+        ../configure \
+          --host=$TARGET --target=$TARGET --build=$CHOST \
+          --prefix=$PREFIX --libdir=$PREFIX/lib --includedir=$PREFIX/include \
+          --enable-static --enable-shared
+        make -j $(nproc)
+
+        # Install manually because I have no idea why now I'm getting "Could not determine the host path" error
+        sudo cp libcharset/include/libcharset.h $PREFIX/include
+        sudo cp libcharset/include/localcharset.h $PREFIX/include
+        sudo cp lib/libcharset.a $PREFIX/lib
+        sudo cp lib/libcharset.dll.a $PREFIX/lib
+        sudo cp bin/libcharset-1.dll $PREFIX/bin
+        sudo cp include/iconv.h $PREFIX/include
+        sudo cp lib/.libs/libiconv.a $PREFIX/lib
+        sudo cp lib/.libs/libiconv.dll.a $PREFIX/lib
+        sudo cp lib/.libs/libiconv-2.dll $PREFIX/bin
+
+    - name: Build libarchive
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://github.com/libarchive/libarchive/archive/v3.4.3.tar.gz' | tar -x --gzip
+        cd libarchive-*
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DZLIB_WINAPI_EXITCODE=PLEASE_FILL_OUT-FAILED_TO_RUN \
+          -DZLIB_WINAPI_EXITCODE__TRYRUN_OUTPUT=PLEASE_FILL_OUT-NOTFOUND
+        cd build
+        # Set GCC library path
+        cmake .. -DLIBGCC_LIBRARY=$LIBGCC
+        sudo make -j $(nproc) install
+
+    - name: Build Ogg library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL https://github.com/xiph/ogg/archive/v1.3.4.tar.gz | tar -x --gzip
+        cd ogg-*
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DBUILD_SHARED_LIBS=ON
+        cd build
+        sudo make -j $(nproc) install
+
+        # Make ogg dynamic library match the name defined in the def file
+        sudo mv $PREFIX/bin/libogg.dll $PREFIX/bin/ogg.dll
+
+    - name: Build Vorbis library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://github.com/xiph/vorbis/archive/v1.3.7.tar.gz' | tar -x --gzip
+        cd vorbis-*
+
+        # Have to modify some LIBRARY definitions to include the filenames
+        for x in win32/*.def; do sed --in-place --expression "s/LIBRARY/LIBRARY $(basename "${x%.*}")/" "$x"; done
+
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DBUILD_SHARED_LIBS=ON
+        cd build
+        sudo make -j $(nproc) install
+
+        # Make vorbis dynamic libraries match the name defined in the def file
+        sudo mv $PREFIX/bin/libvorbis.dll $PREFIX/bin/vorbis.dll
+        sudo mv $PREFIX/bin/libvorbisenc.dll $PREFIX/bin/vorbisenc.dll
+        sudo mv $PREFIX/bin/libvorbisfile.dll $PREFIX/bin/vorbisfile.dll
+
+    - name: Build FLAC library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        # The last tag seems to have undefined references to __memcpy_chk even with -fstack-protector
+        curl -sL 'https://github.com/xiph/flac/archive/ce6dd6b5732e319ef60716d9cc9af6a836a4011a.tar.gz' | tar -x --gzip
+        cd flac-*
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DBUILD_SHARED_LIBS=ON
+        cd build
+        sudo make -j $(nproc) install
+
+    - name: Build TIFF library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      env:
+        CFLAGS: -D_FORTIFY_SOURCE=0 -O2 -pipe -fno-plt -fexceptions
+        CXXFLAGS: -D_FORTIFY_SOURCE=0
+      run: |-
+        curl -sL 'https://gitlab.com/libtiff/libtiff/-/archive/v4.1.0/libtiff-v4.1.0.tar.gz' | tar -x --gzip
+        cd libtiff-*
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DBUILD_SHARED_LIBS=ON
+        cd build
+        sudo make -j $(nproc) install
+
+    - name: Build Freetype library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://github.com/freetype/freetype2/archive/VER-2-10-2.tar.gz' | tar -x --gzip
+        cd freetype2-*
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DBUILD_SHARED_LIBS=ON
+        cd build
+        sudo make -j $(nproc) install
+
+    - name: Build samplerate library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://github.com/libsndfile/libsamplerate/archive/67b53baa8913efadd8663f7317f565d6452c402e.tar.gz' | tar -x --gzip
+        cd libsamplerate-*
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DBUILD_SHARED_LIBS=ON
+        cd build
+        sudo make -j $(nproc) install
+
+    - name: Build EGL library
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        curl -sL 'https://github.com/McNopper/EGL/archive/184bbd45d44d6bd6575e1c411b845acfabb4b03e.tar.gz' | tar -x --gzip
+        cd EGL-*/EGL
+        cmake -E make_directory build
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+          -DEGL_NO_GLEW=ON
+        cd build
+        make -j $(nproc)
+
+        sudo mv libegl.a $PREFIX/lib
+        sudo cp -r ../include $PREFIX
+
+    - name: Build QT5
+      working-directory: ${{github.workspace}}/build/ext/sources
+      run: |-
+        git clone --depth=1 --branch=v5.15.1 https://code.qt.io/qt/qt5.git
+        cd qt5
+        git submodule update --init --recursive -j $(nproc)
+        mkdir build
+        cd build
+        ../configure \
+          -xplatform win32-g++ \
+          -device-option CROSS_COMPILE=/usr/bin/x86_64-w64-mingw32- \
+          -prefix $PREFIX \
+          -confirm-license -opensource -release -shared -no-compile-examples \
+          -skip qt3d -skip qtandroidextras -skip qtcanvas3d -skip qtcharts \
+          -skip qtdatavis3d -skip qtdoc -skip qtdocgallery -skip qtfeedback \
+          -skip qtgamepad -skip qtgraphicaleffects -skip qtimageformats -skip qtlocation \
+          -skip qtlottie -skip qtmacextras -skip qtnetworkauth -skip qtpim \
+          -skip qtpurchasing -skip qtqa -skip qtquick3d -skip qtquickcontrols \
+          -skip qtquickcontrols2 -skip qtquicktimeline -skip qtremoteobjects -skip qtrepotools \
+          -skip qtscript -skip qtscxml -skip qtsensors -skip qtserialbus \
+          -skip qtserialport -skip qtspeech -skip qtsvg -skip qttranslations \
+          -skip qtvirtualkeyboard -skip qtwayland -skip qtwebchannel -skip qtwebengine \
+          -skip qtwebglplugin -skip qtwebsockets -skip webview -skip qtxmlpatterns \
+          -skip qtconnectivity -skip qttools -skip qtactiveqt -skip qtdeclarative \
+          -skip qtx11extras
+
+        # The install command does not trigger the compilation process :S
+        make -j $(nproc)
+        sudo make install
+
+    - name: Checkout Invader
+      uses: actions/checkout@v2
+      with:
+        # Get all history - the build process uses the number of commits
+        fetch-depth: 0
+        path: invader
+
+    - name: Build Invader
+      id: build_invader
+      run: |-
+        cmake -S invader -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/build/toolchain.cmake \
+          -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/build/output
+        cd build
+        sudo make -j $(nproc) install
+
+    - name: Get Invader build info
+      id: get_invader_build_info
+      run: |-
+        echo ::set-output name=version::`grep CMAKE_PROJECT_VERSION:STATIC build/CMakeCache.txt | cut -d "=" -f2`
+        echo ::set-output name=commit_count::`git -C invader rev-list --count HEAD`
+        echo ::set-output name=commit_hash::`git -C invader rev-parse --short HEAD`
+        echo ::set-output name=tag_name::${GITHUB_REF#refs/tags/}
+
+    - name: "Set up package"
+      id: set_up_package
+      run: |-
+        # Set up package directory
+        mkdir package
+        cd package
+
+        # Copy invader binaries
+        cp $GITHUB_WORKSPACE/build/output/bin/* .
+
+        # Copy Invader readme files
+        cp $GITHUB_WORKSPACE/invader/CHANGELOG.md .
+        cp $GITHUB_WORKSPACE/invader/COPYING LICENSE.txt
+        cp $GITHUB_WORKSPACE/invader/README.md .
+
+        # Copy GCC/C++ shared libraries
+        cp /usr/lib/gcc/$TARGET/10-posix/libgcc_s_seh-1.dll .
+        cp /usr/lib/gcc/$TARGET/10-posix/libstdc++-6.dll .
+
+        # Copy libraries
+        cp /usr/x86_64-w64-mingw32/bin/libzlib.dll .
+        cp /usr/x86_64-w64-mingw32/bin/libzstd.dll .
+        cp /usr/x86_64-w64-mingw32/bin/libiconv-2.dll .
+        cp /usr/x86_64-w64-mingw32/bin/libarchive.dll .
+        cp /usr/x86_64-w64-mingw32/bin/ogg.dll .
+        cp /usr/x86_64-w64-mingw32/bin/vorbis.dll .
+        cp /usr/x86_64-w64-mingw32/bin/libFLAC.dll .
+        cp /usr/x86_64-w64-mingw32/bin/libtiff.dll .
+        cp /usr/x86_64-w64-mingw32/bin/libfreetype.dll .
+        cp /usr/x86_64-w64-mingw32/bin/libsamplerate-0.dll .
+
+        # Copy QT5 dependencies
+        cp /usr/x86_64-w64-mingw32/bin/Qt5Core.dll .
+        cp /usr/x86_64-w64-mingw32/bin/Qt5Gui.dll .
+        cp /usr/x86_64-w64-mingw32/bin/Qt5Multimedia.dll .
+        cp /usr/x86_64-w64-mingw32/bin/Qt5Network.dll .
+        cp /usr/x86_64-w64-mingw32/bin/Qt5Widgets.dll .
+        
+        # Copy QT5 plugins
+        mkdir audio platforms styles
+        cp /usr/x86_64-w64-mingw32/plugins/audio/qtaudio_windows.dll audio/
+        cp /usr/x86_64-w64-mingw32/plugins/platforms/qwindows.dll platforms/
+        cp /usr/x86_64-w64-mingw32/plugins/styles/qwindowsvistastyle.dll styles/
+
+        # Get version
+        export INVADER_VERSION=${{steps.get_invader_build_info.outputs.version}}
+        export INVADER_COMMIT_COUNT=${{steps.get_invader_build_info.outputs.commit_count}}
+        export INVADER_COMMIT_HASH=${{steps.get_invader_build_info.outputs.commit_hash}}
+
+        # Pack it!
+        PACKAGE_NAME=invader-$INVADER_VERSION-r$INVADER_COMMIT_COUNT-$INVADER_COMMIT_HASH-win32-$ARCH
+        7z a ../$PACKAGE_NAME.7z *
+        echo ::set-output name=package_name::$PACKAGE_NAME
+
+    - name: Upload artifact
+      if: "!startsWith(github.ref, 'refs/tags/')"
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{steps.set_up_package.outputs.package_name}}
+        path: ${{github.workspace}}/package/*
+
+    - name: "Create release"
+      id: create_release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      with:
+        tag_name: ${{steps.get_invader_build_info.outputs.tag_name}}
+        release_name: Invader v${{steps.get_invader_build_info.outputs.version}}
+        draft: false
+        prerelease: false
+
+    - name: "Upload build"
+      uses: actions/upload-release-asset@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      with:
+        upload_url: ${{steps.create_release.outputs.upload_url}}
+        asset_path: ${{github.workspace}}/${{steps.set_up_package.outputs.package_name}}.7z
+        asset_name: ${{steps.set_up_package.outputs.package_name}}.7z
+        asset_content_type: application/x-7z-compressed
